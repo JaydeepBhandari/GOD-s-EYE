@@ -8,27 +8,11 @@ import supplyNodes from '../data/supplyNodes';
 const SURAT_CENTER = [21.1702, 72.8311];
 const SURAT_ZOOM = 12;
 
-// Dark tile layer (free, no API key)
 const DARK_TILE_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
 const DARK_TILE_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>';
 
-// ─── Custom Pulse Marker (HTML via DivIcon) ───
+// ─── Pulse marker icon ───
 function createPulseIcon(urgency) {
-    const colorMap = {
-        critical: 'var(--pulse-red)',
-        high: 'var(--pulse-red)',
-        medium: 'var(--amber)',
-        stable: 'var(--cyan)',
-    };
-    const glowMap = {
-        critical: 'rgba(255,49,49,0.4)',
-        high: 'rgba(255,49,49,0.3)',
-        medium: 'rgba(255,179,0,0.3)',
-        stable: 'rgba(0,212,255,0.3)',
-    };
-    const color = colorMap[urgency] || colorMap.stable;
-    const glow = glowMap[urgency] || glowMap.stable;
-
     return L.divIcon({
         className: '',
         iconSize: [30, 30],
@@ -41,6 +25,7 @@ function createPulseIcon(urgency) {
     });
 }
 
+// ─── Supply marker icon ───
 function createSupplyIcon() {
     return L.divIcon({
         className: '',
@@ -50,23 +35,48 @@ function createSupplyIcon() {
     });
 }
 
-// ─── Component that manages dynamic markers on the map ───
+// ─── Team marker icon ───
+function createTeamIcon(type, status) {
+    const emoji = type === 'rescue' ? '🚨' : type === 'medical' ? '🚑' : type === 'supply' ? '🚛' : '⚡';
+    const ringColor = status === 'on-site' ? '#00E676' : '#FFB300';
+    return L.divIcon({
+        className: '',
+        iconSize: [36, 36],
+        iconAnchor: [18, 18],
+        html: `<div class="team-marker" style="
+      width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+      background: rgba(10,10,10,0.85); border-radius: 50%;
+      border: 2px solid ${ringColor}; box-shadow: 0 0 10px ${ringColor}40;
+      font-size: 14px; cursor: pointer; position: relative;
+    ">
+      ${emoji}
+      <div style="
+        position: absolute; bottom: -4px; right: -4px;
+        width: 10px; height: 10px; border-radius: 50%;
+        background: ${ringColor}; border: 2px solid #050505;
+      "></div>
+    </div>`,
+    });
+}
+
+// ─── Component that manages all dynamic markers ───
 function MapMarkers() {
     const map = useMap();
-    const markersRef = useRef(L.layerGroup());
+    const needMarkersRef = useRef(L.layerGroup());
     const supplyMarkersRef = useRef(L.layerGroup());
+    const teamMarkersRef = useRef({});  // keyed by team id for smooth updates
 
     const posts = useStore(s => s.posts);
     const selectNode = useStore(s => s.selectNode);
     const activeFilter = useStore(s => s.activeFilter);
+    const teams = useStore(s => s.teams);
 
     const needNodes = useMemo(() => getNeedNodes({ posts, activeFilter }), [posts, activeFilter]);
 
-    // Supply markers (static, rendered once)
+    // Supply markers (static, once)
     useEffect(() => {
         const group = supplyMarkersRef.current;
         group.clearLayers();
-
         supplyNodes.forEach(node => {
             const marker = L.marker([node.lat, node.lng], { icon: createSupplyIcon() });
             marker.bindPopup(`
@@ -79,23 +89,19 @@ function MapMarkers() {
       `, { className: 'dark-popup' });
             group.addLayer(marker);
         });
-
         group.addTo(map);
         return () => { group.clearLayers(); };
     }, [map]);
 
-    // Need-node markers (update when posts/filter change)
+    // Need-node markers (update with posts/filter)
     useEffect(() => {
-        const group = markersRef.current;
+        const group = needMarkersRef.current;
         group.clearLayers();
-
         needNodes.forEach(node => {
             const marker = L.marker([node.lat, node.lng], { icon: createPulseIcon(node.maxUrgency) });
-
             const urgencyColor = node.maxUrgency === 'critical' ? '#FF3131'
                 : node.maxUrgency === 'high' ? '#FF6B6B'
                     : node.maxUrgency === 'medium' ? '#FFB300' : '#00D4FF';
-
             marker.bindPopup(`
         <div style="font-family:'Inter',sans-serif;min-width:160px;">
           <div style="font-weight:700;font-size:0.85rem;margin-bottom:4px;color:#FF3131;">${node.zone}</div>
@@ -104,17 +110,49 @@ function MapMarkers() {
           <div style="font-size:0.65rem;margin-top:4px;color:#555;">Click to view feed →</div>
         </div>
       `, { className: 'dark-popup' });
-
-            marker.on('click', () => {
-                selectNode(node.zone);
-            });
-
+            marker.on('click', () => { selectNode(node.zone); });
             group.addLayer(marker);
         });
-
         group.addTo(map);
         return () => { group.clearLayers(); };
     }, [needNodes, map, selectNode]);
+
+    // Team markers (update positions smoothly)
+    useEffect(() => {
+        teams.forEach(team => {
+            if (!team.currentPos) return;
+            const latLng = [team.currentPos.lat, team.currentPos.lng];
+            const statusLabel = team.status === 'on-site' ? '● On-Site' : `${team.distanceKm}km away`;
+            const statusColor = team.status === 'on-site' ? '#00E676' : '#FFB300';
+
+            if (teamMarkersRef.current[team.id]) {
+                // Update existing marker position (smooth)
+                teamMarkersRef.current[team.id].setLatLng(latLng);
+                teamMarkersRef.current[team.id].setIcon(createTeamIcon(team.type, team.status));
+                teamMarkersRef.current[team.id].setPopupContent(`
+          <div style="font-family:'Inter',sans-serif;min-width:180px;">
+            <div style="font-weight:700;font-size:0.85rem;margin-bottom:4px;color:${statusColor};">${team.name}</div>
+            <div style="font-size:0.7rem;color:#8A8A8A;">Type: ${team.type}</div>
+            <div style="font-size:0.7rem;color:#8A8A8A;">Target: <span style="color:#F0F0F0;font-weight:500;">${team.targetZone}</span></div>
+            <div style="font-size:0.7rem;color:${statusColor};font-weight:600;">${statusLabel}</div>
+          </div>
+        `);
+            } else {
+                // Create new marker
+                const marker = L.marker(latLng, { icon: createTeamIcon(team.type, team.status), zIndexOffset: 1000 });
+                marker.bindPopup(`
+          <div style="font-family:'Inter',sans-serif;min-width:180px;">
+            <div style="font-weight:700;font-size:0.85rem;margin-bottom:4px;color:${statusColor};">${team.name}</div>
+            <div style="font-size:0.7rem;color:#8A8A8A;">Type: ${team.type}</div>
+            <div style="font-size:0.7rem;color:#8A8A8A;">Target: <span style="color:#F0F0F0;font-weight:500;">${team.targetZone}</span></div>
+            <div style="font-size:0.7rem;color:${statusColor};font-weight:600;">${statusLabel}</div>
+          </div>
+        `, { className: 'dark-popup' });
+                marker.addTo(map);
+                teamMarkersRef.current[team.id] = marker;
+            }
+        });
+    }, [teams, map]);
 
     return null;
 }
@@ -134,7 +172,7 @@ export default function MapView() {
                 <MapMarkers />
             </MapContainer>
 
-            {/* Map overlay gradient at edges */}
+            {/* Edge gradient */}
             <div
                 className="absolute inset-0 pointer-events-none z-[1000]"
                 style={{
@@ -164,6 +202,10 @@ export default function MapView() {
                 <div className="flex items-center gap-2">
                     <div className="w-2.5 h-2.5 rounded-full" style={{ background: 'var(--cyan)', boxShadow: '0 0 6px var(--cyan)' }} />
                     <span className="text-[0.65rem]" style={{ color: 'var(--text-secondary)' }}>Supply Node</span>
+                </div>
+                <div className="flex items-center gap-2">
+                    <div className="w-5 h-5 rounded-full flex items-center justify-center text-[0.5rem]" style={{ background: 'rgba(10,10,10,0.85)', border: '2px solid var(--amber)', boxShadow: '0 0 6px rgba(255,179,0,0.3)' }}>🚨</div>
+                    <span className="text-[0.65rem]" style={{ color: 'var(--text-secondary)' }}>Dispatch Team</span>
                 </div>
             </div>
         </div>
